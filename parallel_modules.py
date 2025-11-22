@@ -48,16 +48,17 @@ class ParallelConv2d(nn.Module):
             self.world_size = 1
         
         # Create standard nn.Conv2d with ONLY numeric parameters
-        # Use positional arguments for the required ones to ensure correctness
+        # Use keyword arguments to prevent positional argument confusion,
+        # especially with the process_group being passed from the wrapper's __init__
         self.conv = nn.Conv2d(
-            in_channels,      # positional arg 1
-            out_channels,     # positional arg 2
-            kernel_size,      # positional arg 3
-            stride,           # positional arg 4
-            padding,          # positional arg 5
-            dilation,         # positional arg 6
-            groups,           # positional arg 7
-            bias,             # positional arg 8
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
         )
         
         # Verify Conv2d was created correctly with integer dilation
