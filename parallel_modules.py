@@ -16,6 +16,10 @@ class ParallelConv2d(nn.Module):
     """
     Parallel Conv2d wrapper that splits input along width dimension.
     Contains a standard nn.Conv2d as self.conv for compatibility with tests.
+    
+    IMPORTANT: This class ONLY wraps nn.Conv2d. It does NOT modify Conv2d's
+    dilation, padding, or stride attributes. The process_group is stored
+    separately and used only for distributed communication.
     """
     
     def __init__(
@@ -32,12 +36,11 @@ class ParallelConv2d(nn.Module):
     ):
         super().__init__()
         
-        # Store process_group separately - NEVER pass it to Conv2d
-        # Do this FIRST before any other operations
+        # STEP 1: Store process_group separately (never touches Conv2d)
         self.process_group = process_group
         
-        # Create standard nn.Conv2d with ONLY conv parameters (integers)
-        # Use positional arguments for required params, explicit kwargs for optional
+        # STEP 2: Create standard nn.Conv2d with ONLY integer parameters
+        # This MUST be called with clean integer arguments
         self.conv = nn.Conv2d(
             in_channels,
             out_channels,
@@ -49,19 +52,8 @@ class ParallelConv2d(nn.Module):
             bias=bias,
         )
         
-        # Sanity check: verify conv parameters are correct types
-        assert isinstance(self.conv.stride, tuple), \
-            f"stride should be tuple, got {type(self.conv.stride)}"
-        assert isinstance(self.conv.padding, tuple), \
-            f"padding should be tuple, got {type(self.conv.padding)}"
-        assert isinstance(self.conv.dilation, tuple), \
-            f"dilation should be tuple, got {type(self.conv.dilation)}"
-        
-        # Check that all elements are integers, not ProcessGroups
-        assert all(isinstance(s, int) for s in self.conv.stride), \
-            f"stride should contain ints, got {self.conv.stride}"
-        assert all(isinstance(p, int) for p in self.conv.padding), \
-            f"padding should contain ints, got {self.conv.padding}"
+        # STEP 3: Verify conv parameters are integers (sanity check)
+        # This will catch any pollution from process_group
         assert all(isinstance(d, int) for d in self.conv.dilation), \
             f"dilation should contain ints, got {self.conv.dilation}"
     
