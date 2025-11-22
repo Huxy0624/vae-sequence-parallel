@@ -36,24 +36,34 @@ class ParallelConv2d(nn.Module):
     ):
         super().__init__()
         
-        # STEP 1: Store process_group separately (never touches Conv2d)
+        # CRITICAL: Store process_group FIRST, completely separate from Conv2d params
         self.process_group = process_group
         
-        # STEP 2: Create standard nn.Conv2d with ONLY integer parameters
-        # This MUST be called with clean integer arguments
+        # Extract and validate Conv2d parameters BEFORE creating Conv2d
+        # This ensures no accidental mixing with process_group
+        conv_in_channels = in_channels
+        conv_out_channels = out_channels
+        conv_kernel_size = kernel_size
+        conv_stride = stride
+        conv_padding = padding
+        conv_dilation = dilation
+        conv_groups = groups
+        conv_bias = bias
+        
+        # Create nn.Conv2d with explicitly named local variables
+        # NEVER pass process_group here - it's already saved above
         self.conv = nn.Conv2d(
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride=stride,
-            padding=padding,
-            dilation=dilation,
-            groups=groups,
-            bias=bias,
+            conv_in_channels,
+            conv_out_channels,
+            conv_kernel_size,
+            stride=conv_stride,
+            padding=conv_padding,
+            dilation=conv_dilation,
+            groups=conv_groups,
+            bias=conv_bias,
         )
         
-        # STEP 3: Verify conv parameters are integers (sanity check)
-        # This will catch any pollution from process_group
+        # Sanity check: verify dilation contains integers, not ProcessGroups
         assert all(isinstance(d, int) for d in self.conv.dilation), \
             f"dilation should contain ints, got {self.conv.dilation}"
     
