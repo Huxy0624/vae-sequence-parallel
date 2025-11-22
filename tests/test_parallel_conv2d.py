@@ -58,13 +58,31 @@ def test_parallel_conv2d(in_channels, out_channels, kernel_size, stride, padding
         out_parallel_chunk = parallel_conv(x_chunk)
         out_baseline = baseline_conv(x_full)
     
-    # Gather parallel outputs along width
-    out_parallel_list = [torch.zeros_like(out_parallel_chunk) for _ in range(world_size)]
-    dist.all_gather(out_parallel_list, out_parallel_chunk, group=process_group)
+    # First, gather information about output shapes from all ranks
+    out_shape = torch.tensor([out_parallel_chunk.shape[3]], dtype=torch.int64)  # width
+    all_shapes = [torch.zeros(1, dtype=torch.int64) for _ in range(world_size)]
+    dist.all_gather(all_shapes, out_shape, group=process_group)
     
-    # Reconstruct full output
+    # Calculate total width and create properly sized tensors for gathering
+    total_width = sum(s.item() for s in all_shapes)
+    max_width = max(s.item() for s in all_shapes)
+    
+    # Create padded tensor for gathering (all same size)
+    B_out, C_out, H_out = out_parallel_chunk.shape[:3]
+    padded_chunk = torch.zeros(B_out, C_out, H_out, max_width, dtype=out_parallel_chunk.dtype)
+    padded_chunk[:, :, :, :out_parallel_chunk.shape[3]] = out_parallel_chunk
+    
+    # Gather padded outputs
+    out_parallel_list = [torch.zeros_like(padded_chunk) for _ in range(world_size)]
+    dist.all_gather(out_parallel_list, padded_chunk, group=process_group)
+    
+    # Reconstruct full output by trimming padding
     if rank == 0:
-        out_parallel_full = gather_along_width(out_parallel_list, out_baseline.shape[3])
+        trimmed_list = []
+        for i, out_tensor in enumerate(out_parallel_list):
+            actual_width = all_shapes[i].item()
+            trimmed_list.append(out_tensor[:, :, :, :actual_width])
+        out_parallel_full = torch.cat(trimmed_list, dim=3)
         
         # Compare outputs using allclose
         if not torch.allclose(out_parallel_full, out_baseline, rtol=1e-3, atol=1e-5):
