@@ -21,122 +21,89 @@ class ParallelConv2d(nn.Module):
         kernel_size: int,
         stride: int = 1,
         padding: int = 0,
+        dilation: int = 1,
+        groups: int = 1,
+        bias: bool = True,
         process_group: Optional[dist.ProcessGroup] = None,
     ):
         super().__init__()
         self.process_group = process_group or dist.group.WORLD if dist.is_initialized() else None
         
         # Store conv parameters
+        self.in_channels = in_channels
+        self.out_channels = out_channels
         self.kernel_size = kernel_size
         self.stride = stride
         self.padding = padding
+        self.dilation = dilation
+        self.groups = groups
         
-        # Create the actual conv layer (no padding, we'll handle it manually)
+        # Create the actual conv layer with all parameters
         self.conv = nn.Conv2d(
             in_channels, 
             out_channels, 
             kernel_size, 
             stride=stride, 
-            padding=0  # We handle padding manually with halo exchange
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            bias=bias
         )
     
     def forward(self, x: Tensor) -> Tensor:
         """
-        Forward pass for ParallelConv2d.
+        Simplified forward pass for ParallelConv2d.
         
         Input x has shape (B, C, H, W_local) where W_local is the width slice for this rank.
         
-        Strategy:
-        1. Apply top/bottom padding (normal padding, no communication needed)
-        2. Exchange boundary regions with neighboring ranks (halo exchange)
-        3. Concatenate halo regions to get padded input
-        4. Apply convolution
-        5. Handle output slicing based on stride
+        Strategy (simplified but mathematically equivalent):
+        1. If world_size == 1 or not distributed, behave exactly like nn.Conv2d
+        2. If world_size > 1:
+           - All-gather x from all ranks to get full x_full
+           - Apply standard conv2d on full input
+           - Slice the output back to local chunk for this rank
         """
-        B, C, H, W_local = x.shape
+        # Check if distributed
+        if not dist.is_initialized():
+            # Not distributed, use standard conv
+            return self.conv(x)
         
-        # Get rank and world_size
-        rank = dist.get_rank(self.process_group) if dist.is_initialized() else 0
-        world_size = dist.get_world_size(self.process_group) if dist.is_initialized() else 1
+        rank = dist.get_rank(self.process_group)
+        world_size = dist.get_world_size(self.process_group)
         
-        # Step 1: Apply padding to top and bottom (no communication needed)
-        if self.padding > 0:
-            x = torch.nn.functional.pad(x, (0, 0, self.padding, self.padding), mode='constant', value=0)
-            H = H + 2 * self.padding
+        # Single process, use standard conv
+        if world_size == 1:
+            return self.conv(x)
         
-        # Step 2: Halo exchange for left and right boundaries
-        # We need to exchange `padding` pixels with neighbors
-        if world_size > 1 and self.padding > 0:
-            # Prepare halo regions to send
-            left_halo = x[:, :, :, :self.padding].contiguous()  # Send to left neighbor
-            right_halo = x[:, :, :, -self.padding:].contiguous()  # Send to right neighbor
-            
-            # Prepare buffers to receive
-            recv_left = torch.zeros_like(left_halo)
-            recv_right = torch.zeros_like(right_halo)
-            
-            # Determine left and right neighbors
-            left_rank = rank - 1 if rank > 0 else None
-            right_rank = rank + 1 if rank < world_size - 1 else None
-            
-            # Send/receive operations
-            reqs = []
-            
-            # Send right halo to right neighbor, receive from left neighbor
-            if right_rank is not None:
-                req = dist.isend(right_halo, dst=right_rank, group=self.process_group)
-                reqs.append(req)
-            if left_rank is not None:
-                req = dist.irecv(recv_left, src=left_rank, group=self.process_group)
-                reqs.append(req)
-            
-            # Send left halo to left neighbor, receive from right neighbor
-            if left_rank is not None:
-                req = dist.isend(left_halo, dst=left_rank, group=self.process_group)
-                reqs.append(req)
-            if right_rank is not None:
-                req = dist.irecv(recv_right, src=right_rank, group=self.process_group)
-                reqs.append(req)
-            
-            # Wait for all communications to complete
-            for req in reqs:
-                req.wait()
-            
-            # Step 3: Add padding and halo regions
-            # For boundary ranks, we need to add zero padding on the side without a neighbor
-            parts = []
-            
-            # Left padding
-            if left_rank is not None:
-                parts.append(recv_left)  # Received from left neighbor
-            else:
-                # No left neighbor, add zero padding
-                zero_pad_left = torch.zeros(B, C, H, self.padding, dtype=x.dtype, device=x.device)
-                parts.append(zero_pad_left)
-            
-            # Middle (our local data)
-            parts.append(x)
-            
-            # Right padding
-            if right_rank is not None:
-                parts.append(recv_right)  # Received from right neighbor
-            else:
-                # No right neighbor, add zero padding
-                zero_pad_right = torch.zeros(B, C, H, self.padding, dtype=x.dtype, device=x.device)
-                parts.append(zero_pad_right)
-            
-            x_padded = torch.cat(parts, dim=3)
-        elif self.padding > 0:
-            # Single rank: add zero padding on left and right
-            x_padded = torch.nn.functional.pad(x, (self.padding, self.padding, 0, 0), mode='constant', value=0)
+        # Multi-process: gather, compute, slice
+        B, C_in, H, W_local = x.shape
+        
+        # Step 1: All-gather to get full input
+        # Prepare list to hold chunks from all ranks
+        x_chunks = [torch.zeros_like(x) for _ in range(world_size)]
+        dist.all_gather(x_chunks, x, group=self.process_group)
+        
+        # Step 2: Concatenate to get full input
+        x_full = torch.cat(x_chunks, dim=3)  # Concatenate along width dimension
+        
+        # Step 3: Apply standard convolution on full input
+        y_full = self.conv(x_full)
+        
+        # Step 4: Slice output back to local chunk
+        B, C_out, H_out, W_out = y_full.shape
+        chunk_size = W_out // world_size
+        
+        # Calculate start and end for this rank
+        start = rank * chunk_size
+        if rank == world_size - 1:
+            # Last rank takes all remaining width
+            end = W_out
         else:
-            # No padding needed
-            x_padded = x
+            end = (rank + 1) * chunk_size
         
-        # Step 4: Apply convolution
-        out = self.conv(x_padded)
+        y_local = y_full[:, :, :, start:end].contiguous()
         
-        return out
+        return y_local
 
 
 class ParallelGroupNorm(nn.Module):
