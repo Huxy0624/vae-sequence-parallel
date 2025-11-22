@@ -27,16 +27,8 @@ class ParallelConv2d(nn.Module):
         process_group: Optional[dist.ProcessGroup] = None,
     ):
         super().__init__()
-        self.process_group = process_group or dist.group.WORLD if dist.is_initialized() else None
-        
-        # Store conv parameters
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.kernel_size = kernel_size
-        self.stride = stride
-        self.padding = padding
-        self.dilation = dilation
-        self.groups = groups
+        # Store process group separately to avoid naming conflicts
+        self.pg = process_group or (dist.group.WORLD if dist.is_initialized() else None)
         
         # Create the actual conv layer with all parameters
         self.conv = nn.Conv2d(
@@ -68,8 +60,8 @@ class ParallelConv2d(nn.Module):
             # Not distributed, use standard conv
             return self.conv(x)
         
-        rank = dist.get_rank(self.process_group)
-        world_size = dist.get_world_size(self.process_group)
+        rank = dist.get_rank(self.pg)
+        world_size = dist.get_world_size(self.pg)
         
         # Single process, use standard conv
         if world_size == 1:
@@ -81,7 +73,7 @@ class ParallelConv2d(nn.Module):
         # Step 1: All-gather to get full input
         # Prepare list to hold chunks from all ranks
         x_chunks = [torch.zeros_like(x) for _ in range(world_size)]
-        dist.all_gather(x_chunks, x, group=self.process_group)
+        dist.all_gather(x_chunks, x, group=self.pg)
         
         # Step 2: Concatenate to get full input
         x_full = torch.cat(x_chunks, dim=3)  # Concatenate along width dimension
