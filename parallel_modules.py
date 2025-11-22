@@ -20,52 +20,50 @@ class ParallelConv2d(nn.Module):
     
     def __init__(
         self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int,
-        stride: int = 1,
-        padding: int = 0,
-        dilation: int = 1,
-        groups: int = 1,
-        bias: bool = True,
-        process_group: Optional[dist.ProcessGroup] = None,
-        **kwargs,
+        in_channels,
+        out_channels,
+        kernel_size,
+        stride=1,
+        padding=0,
+        dilation=1,
+        groups=1,
+        bias=True,
+        process_group=None,
     ):
         super().__init__()
         
         # Store process_group separately - NEVER pass it to Conv2d
+        # Do this FIRST before any other operations
         self.process_group = process_group
         
-        # Store conv parameters as local variables to prevent any confusion
-        _stride = stride
-        _padding = padding
-        _dilation = dilation
-        _groups = groups
-        _bias = bias
-        
-        # Create standard nn.Conv2d with clean integer parameters only
+        # Create standard nn.Conv2d with ONLY conv parameters (integers)
+        # Use positional arguments for required params, explicit kwargs for optional
         self.conv = nn.Conv2d(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=kernel_size,
-            stride=_stride,
-            padding=_padding,
-            dilation=_dilation,
-            groups=_groups,
-            bias=_bias,
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
         )
         
-        # Verify that conv parameters are correct types (int tuples, not ProcessGroups)
-        assert isinstance(self.conv.stride, tuple), f"stride should be tuple, got {type(self.conv.stride)}"
-        assert isinstance(self.conv.padding, tuple), f"padding should be tuple, got {type(self.conv.padding)}"
-        assert isinstance(self.conv.dilation, tuple), f"dilation should be tuple, got {type(self.conv.dilation)}"
-        assert all(isinstance(s, int) for s in self.conv.stride), f"stride should contain ints, got {self.conv.stride}"
-        assert all(isinstance(p, int) for p in self.conv.padding), f"padding should contain ints, got {self.conv.padding}"
-        assert all(isinstance(d, int) for d in self.conv.dilation), f"dilation should contain ints, got {self.conv.dilation}"
+        # Sanity check: verify conv parameters are correct types
+        assert isinstance(self.conv.stride, tuple), \
+            f"stride should be tuple, got {type(self.conv.stride)}"
+        assert isinstance(self.conv.padding, tuple), \
+            f"padding should be tuple, got {type(self.conv.padding)}"
+        assert isinstance(self.conv.dilation, tuple), \
+            f"dilation should be tuple, got {type(self.conv.dilation)}"
         
-        # Additional specific checks for dilation as requested
-        assert isinstance(self.conv.dilation[0], int), f"dilation[0] should be int, got {type(self.conv.dilation[0])}"
-        assert isinstance(self.conv.dilation[1], int), f"dilation[1] should be int, got {type(self.conv.dilation[1])}"
+        # Check that all elements are integers, not ProcessGroups
+        assert all(isinstance(s, int) for s in self.conv.stride), \
+            f"stride should contain ints, got {self.conv.stride}"
+        assert all(isinstance(p, int) for p in self.conv.padding), \
+            f"padding should contain ints, got {self.conv.padding}"
+        assert all(isinstance(d, int) for d in self.conv.dilation), \
+            f"dilation should contain ints, got {self.conv.dilation}"
     
     def forward(self, x: Tensor) -> Tensor:
         """
