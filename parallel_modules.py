@@ -12,7 +12,11 @@ from autoencoder_2d import (
 )
 
 
-class ParallelConv2d(nn.Module):
+class ParallelConv2d(nn.Conv2d):
+    """
+    Parallel Conv2d layer that splits input along width dimension.
+    Inherits from nn.Conv2d to access weight, bias, and conv parameters directly.
+    """
     
     def __init__(
         self,
@@ -24,14 +28,11 @@ class ParallelConv2d(nn.Module):
         dilation: int = 1,
         groups: int = 1,
         bias: bool = True,
+        padding_mode: str = 'zeros',
         process_group: Optional[dist.ProcessGroup] = None,
     ):
-        super().__init__()
-        # Store process group separately to avoid naming conflicts
-        self.pg = process_group or (dist.group.WORLD if dist.is_initialized() else None)
-        
-        # Create the actual conv layer with all parameters
-        self.conv = nn.Conv2d(
+        # Initialize parent nn.Conv2d with all conv parameters
+        super().__init__(
             in_channels, 
             out_channels, 
             kernel_size, 
@@ -39,8 +40,11 @@ class ParallelConv2d(nn.Module):
             padding=padding,
             dilation=dilation,
             groups=groups,
-            bias=bias
+            bias=bias,
+            padding_mode=padding_mode
         )
+        # Store process group as separate attribute (NOT as a conv parameter)
+        self.process_group = process_group
     
     def forward(self, x: Tensor) -> Tensor:
         """
@@ -52,50 +56,51 @@ class ParallelConv2d(nn.Module):
         1. If world_size == 1 or not distributed, behave exactly like nn.Conv2d
         2. If world_size > 1:
            - All-gather x from all ranks to get full x_full
-           - Apply standard conv2d on full input
+           - Apply standard conv2d on full input using F.conv2d
            - Slice the output back to local chunk for this rank
         """
         # Check if distributed
         if not dist.is_initialized():
-            # Not distributed, use standard conv
-            return self.conv(x)
+            # Not distributed, use standard F.conv2d
+            return torch.nn.functional.conv2d(
+                x, self.weight, self.bias, 
+                stride=self.stride, padding=self.padding,
+                dilation=self.dilation, groups=self.groups
+            )
         
-        rank = dist.get_rank(self.pg)
-        world_size = dist.get_world_size(self.pg)
+        world_size = dist.get_world_size(self.process_group)
+        rank = dist.get_rank(self.process_group)
         
-        # Single process, use standard conv
+        # Single process, use standard F.conv2d
         if world_size == 1:
-            return self.conv(x)
+            return torch.nn.functional.conv2d(
+                x, self.weight, self.bias,
+                stride=self.stride, padding=self.padding,
+                dilation=self.dilation, groups=self.groups
+            )
         
         # Multi-process: gather, compute, slice
-        B, C_in, H, W_local = x.shape
-        
         # Step 1: All-gather to get full input
-        # Prepare list to hold chunks from all ranks
-        x_chunks = [torch.zeros_like(x) for _ in range(world_size)]
-        dist.all_gather(x_chunks, x, group=self.pg)
+        x_list = [torch.zeros_like(x) for _ in range(world_size)]
+        dist.all_gather(x_list, x, group=self.process_group or dist.group.WORLD)
         
-        # Step 2: Concatenate to get full input
-        x_full = torch.cat(x_chunks, dim=3)  # Concatenate along width dimension
+        # Step 2: Concatenate along width dimension
+        x_full = torch.cat(x_list, dim=-1)  # dim=-1 is width dimension
         
-        # Step 3: Apply standard convolution on full input
-        y_full = self.conv(x_full)
+        # Step 3: Apply full convolution using F.conv2d with explicit parameters
+        y_full = torch.nn.functional.conv2d(
+            x_full, self.weight, self.bias,
+            stride=self.stride, padding=self.padding,
+            dilation=self.dilation, groups=self.groups
+        )
         
         # Step 4: Slice output back to local chunk
         B, C_out, H_out, W_out = y_full.shape
-        chunk_size = W_out // world_size
+        chunk = W_out // world_size
+        start = rank * chunk
+        end = (rank + 1) * chunk if rank != world_size - 1 else W_out
         
-        # Calculate start and end for this rank
-        start = rank * chunk_size
-        if rank == world_size - 1:
-            # Last rank takes all remaining width
-            end = W_out
-        else:
-            end = (rank + 1) * chunk_size
-        
-        y_local = y_full[:, :, :, start:end].contiguous()
-        
-        return y_local
+        return y_full[:, :, :, start:end].contiguous()
 
 
 class ParallelGroupNorm(nn.Module):
