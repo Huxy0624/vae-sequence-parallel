@@ -32,6 +32,7 @@ class ParallelConv2d(nn.Module):
         dilation=1,
         groups=1,
         bias=True,
+        *,  # Force process_group to be keyword-only argument
         process_group=None,
     ):
         super().__init__()
