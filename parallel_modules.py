@@ -32,19 +32,31 @@ class ParallelConv2d(nn.Module):
         **kwargs,
     ):
         super().__init__()
-        # Create standard nn.Conv2d as inner module
+        
+        # IMPORTANT: Store process_group FIRST before creating conv
+        # This ensures it never gets passed to nn.Conv2d
+        self.process_group = process_group
+        
+        # Create standard nn.Conv2d with ONLY conv parameters (no process_group)
+        # Use keyword arguments explicitly to avoid any positional confusion
         self.conv = nn.Conv2d(
-            in_channels,
-            out_channels,
-            kernel_size,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
             stride=stride,
             padding=padding,
             dilation=dilation,
             groups=groups,
             bias=bias,
         )
-        # Store process group separately (never mix with conv parameters)
-        self.process_group = process_group
+        
+        # Verify that conv parameters are correct types (int tuples, not ProcessGroups)
+        assert isinstance(self.conv.stride, tuple), f"stride should be tuple, got {type(self.conv.stride)}"
+        assert isinstance(self.conv.padding, tuple), f"padding should be tuple, got {type(self.conv.padding)}"
+        assert isinstance(self.conv.dilation, tuple), f"dilation should be tuple, got {type(self.conv.dilation)}"
+        assert all(isinstance(s, int) for s in self.conv.stride), f"stride should contain ints, got {self.conv.stride}"
+        assert all(isinstance(p, int) for p in self.conv.padding), f"padding should contain ints, got {self.conv.padding}"
+        assert all(isinstance(d, int) for d in self.conv.dilation), f"dilation should contain ints, got {self.conv.dilation}"
     
     def forward(self, x: Tensor) -> Tensor:
         """
@@ -59,12 +71,14 @@ class ParallelConv2d(nn.Module):
            - Apply self.conv on full input
            - Slice output back to local chunk for this rank
         """
-        # Path 1: Not distributed or single process
+        # Path 1: Not distributed
         if not dist.is_initialized():
             return self.conv(x)
         
-        world_size = dist.get_world_size(self.process_group)
-        rank = dist.get_rank(self.process_group)
+        # Get world_size and rank (use default group if process_group is None)
+        pg = self.process_group or dist.group.WORLD
+        world_size = dist.get_world_size(pg)
+        rank = dist.get_rank(pg)
         
         # Path 2: Single process in distributed environment
         if world_size == 1:
@@ -73,7 +87,7 @@ class ParallelConv2d(nn.Module):
         # Path 3: Multi-process - gather, compute, slice
         # Step 1: All-gather to get full input
         x_list = [torch.zeros_like(x) for _ in range(world_size)]
-        dist.all_gather(x_list, x, group=self.process_group or dist.group.WORLD)
+        dist.all_gather(x_list, x, group=pg)
         
         # Step 2: Concatenate along width dimension (dim=-1 or dim=3)
         x_full = torch.cat(x_list, dim=-1)  # [B, C_in, H, W]
