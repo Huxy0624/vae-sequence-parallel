@@ -36,34 +36,31 @@ class ParallelConv2d(nn.Module):
     ):
         super().__init__()
         
-        # CRITICAL: Store process_group FIRST, completely separate from Conv2d params
+        # Store distributed information separately - NEVER pass to Conv2d
         self.process_group = process_group
         
-        # Extract and validate Conv2d parameters BEFORE creating Conv2d
-        # This ensures no accidental mixing with process_group
-        conv_in_channels = in_channels
-        conv_out_channels = out_channels
-        conv_kernel_size = kernel_size
-        conv_stride = stride
-        conv_padding = padding
-        conv_dilation = dilation
-        conv_groups = groups
-        conv_bias = bias
+        if dist.is_initialized():
+            pg = process_group if process_group is not None else dist.group.WORLD
+            self.rank = dist.get_rank(pg)
+            self.world_size = dist.get_world_size(pg)
+        else:
+            self.rank = 0
+            self.world_size = 1
         
-        # Create nn.Conv2d with explicitly named local variables
-        # NEVER pass process_group here - it's already saved above
+        # Create standard nn.Conv2d with ONLY numeric parameters
+        # Use positional arguments for the required ones to ensure correctness
         self.conv = nn.Conv2d(
-            conv_in_channels,
-            conv_out_channels,
-            conv_kernel_size,
-            stride=conv_stride,
-            padding=conv_padding,
-            dilation=conv_dilation,
-            groups=conv_groups,
-            bias=conv_bias,
+            in_channels,      # positional arg 1
+            out_channels,     # positional arg 2
+            kernel_size,      # positional arg 3
+            stride,           # positional arg 4
+            padding,          # positional arg 5
+            dilation,         # positional arg 6
+            groups,           # positional arg 7
+            bias,             # positional arg 8
         )
         
-        # Sanity check: verify dilation contains integers, not ProcessGroups
+        # Verify Conv2d was created correctly with integer dilation
         assert all(isinstance(d, int) for d in self.conv.dilation), \
             f"dilation should contain ints, got {self.conv.dilation}"
     
@@ -80,23 +77,14 @@ class ParallelConv2d(nn.Module):
            - Apply self.conv on full input
            - Slice output back to local chunk for this rank
         """
-        # Path 1: Not distributed
-        if not dist.is_initialized():
+        # Path 1: Not distributed or single process
+        if self.world_size == 1:
             return self.conv(x)
         
-        # Get world_size and rank (use default group if process_group is None)
-        pg = self.process_group or dist.group.WORLD
-        world_size = dist.get_world_size(pg)
-        rank = dist.get_rank(pg)
-        
-        # Path 2: Single process in distributed environment
-        if world_size == 1:
-            return self.conv(x)
-        
-        # Path 3: Multi-process - gather, compute, slice
+        # Path 2: Multi-process - gather, compute, slice
         # Step 1: All-gather to get full input
-        x_list = [torch.zeros_like(x) for _ in range(world_size)]
-        dist.all_gather(x_list, x, group=pg)
+        x_list = [torch.zeros_like(x) for _ in range(self.world_size)]
+        dist.all_gather(x_list, x, group=self.process_group)
         
         # Step 2: Concatenate along width dimension (dim=-1 or dim=3)
         x_full = torch.cat(x_list, dim=-1)  # [B, C_in, H, W]
@@ -106,9 +94,9 @@ class ParallelConv2d(nn.Module):
         
         # Step 4: Slice output back to local chunk
         B, C_out, H_out, W_out = y_full.shape
-        chunk = W_out // world_size
-        start = rank * chunk
-        end = (rank + 1) * chunk if rank != world_size - 1 else W_out
+        chunk = W_out // self.world_size
+        start = self.rank * chunk
+        end = (self.rank + 1) * chunk if self.rank != self.world_size - 1 else W_out
         y_local = y_full[:, :, :, start:end].contiguous()
         
         return y_local
