@@ -74,14 +74,14 @@ class ParallelConv2d(nn.Module):
     
     def forward(self, x: Tensor) -> Tensor:
         """
-        Forward pass for ParallelConv2d using Halo Exchange strategy.
+        Forward pass for ParallelConv2d using Halo Exchange with non-blocking communication.
         
         Input x has shape (B, C, H, W_local) where W_local is the width slice for this rank.
         
-        Strategy (Halo Exchange):
+        Strategy (Non-blocking Halo Exchange):
         1. If not distributed or world_size == 1: directly call self.conv(x)
         2. If world_size > 1:
-           - Exchange halos (boundary regions) with neighboring ranks
+           - Use isend/irecv for non-blocking halo exchange with neighbors
            - Apply convolution with padding=0 (manual padding via halos)
            - Return local output (no slicing needed)
         """
@@ -89,7 +89,7 @@ class ParallelConv2d(nn.Module):
         if self.world_size == 1:
             return self.conv(x)
         
-        # Path 2: Multi-process - Halo Exchange
+        # Path 2: Multi-process - Non-blocking Halo Exchange
         # Calculate halo size based on padding
         padding = self.conv.padding
         if isinstance(padding, int):
@@ -99,32 +99,52 @@ class ParallelConv2d(nn.Module):
         
         B, C, H, W_local = x.shape
         
-        # Initialize halos
+        # Allocate buffers for halos
         left_halo = torch.zeros(B, C, H, halo_size, dtype=x.dtype, device=x.device)
         right_halo = torch.zeros(B, C, H, halo_size, dtype=x.dtype, device=x.device)
         
-        # Exchange halos with neighbors
-        if self.world_size > 1:
-            # Send/Receive with left neighbor (rank - 1)
+        # List to track all async requests
+        reqs = []
+        
+        # Exchange halos with neighbors using non-blocking communication
+        if self.world_size > 1 and halo_size > 0:
+            # Communicate with left neighbor (rank - 1)
             if self.rank > 0:
-                # Send left boundary to left neighbor, receive left halo from left neighbor
+                # Receive left halo from left neighbor
+                reqs.append(dist.irecv(left_halo, src=self.rank - 1, group=self.process_group))
+                # Send left boundary to left neighbor
                 left_boundary = x[:, :, :, :halo_size].contiguous()
-                dist.send(left_boundary, dst=self.rank - 1, group=self.process_group)
-                dist.recv(left_halo, src=self.rank - 1, group=self.process_group)
-            # else: rank 0, left_halo remains zeros (global padding)
+                reqs.append(dist.isend(left_boundary, dst=self.rank - 1, group=self.process_group))
             
-            # Send/Receive with right neighbor (rank + 1)
+            # Communicate with right neighbor (rank + 1)
             if self.rank < self.world_size - 1:
-                # Send right boundary to right neighbor, receive right halo from right neighbor
+                # Receive right halo from right neighbor
+                reqs.append(dist.irecv(right_halo, src=self.rank + 1, group=self.process_group))
+                # Send right boundary to right neighbor
                 right_boundary = x[:, :, :, -halo_size:].contiguous()
-                dist.send(right_boundary, dst=self.rank + 1, group=self.process_group)
-                dist.recv(right_halo, src=self.rank + 1, group=self.process_group)
-            # else: last rank, right_halo remains zeros (global padding)
+                reqs.append(dist.isend(right_boundary, dst=self.rank + 1, group=self.process_group))
         
-        # Concatenate: [left_halo, x, right_halo]
-        x_padded = torch.cat([left_halo, x, right_halo], dim=3)
+        # Wait for all communication to complete
+        for req in reqs:
+            req.wait()
         
-        # Apply convolution with padding=0 (we've done manual padding)
+        # Build padded input
+        # Left padding: use zeros for rank 0 (global padding), otherwise use received left_halo
+        if self.rank == 0:
+            left_part = torch.zeros(B, C, H, halo_size, dtype=x.dtype, device=x.device)
+        else:
+            left_part = left_halo
+        
+        # Right padding: use zeros for last rank (global padding), otherwise use received right_halo
+        if self.rank == self.world_size - 1:
+            right_part = torch.zeros(B, C, H, halo_size, dtype=x.dtype, device=x.device)
+        else:
+            right_part = right_halo
+        
+        # Concatenate: [left_part, x, right_part]
+        x_padded = torch.cat([left_part, x, right_part], dim=3)
+        
+        # Apply convolution with padding=0 (we've done manual padding via halos)
         y = torch.nn.functional.conv2d(
             x_padded,
             self.conv.weight,
