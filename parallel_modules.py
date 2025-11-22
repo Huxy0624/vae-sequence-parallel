@@ -90,7 +90,7 @@ class ParallelConv2d(nn.Module):
             return self.conv(x)
         
         # Path 2: Multi-process - Non-blocking Halo Exchange
-        # Calculate halo size based on padding
+        # Calculate halo size based on width padding
         padding = self.conv.padding
         if isinstance(padding, int):
             halo_size = padding
@@ -99,9 +99,13 @@ class ParallelConv2d(nn.Module):
         
         B, C, H, W_local = x.shape
         
-        # Allocate buffers for halos
+        # Allocate buffers for receiving halos
         left_halo = torch.zeros(B, C, H, halo_size, dtype=x.dtype, device=x.device)
         right_halo = torch.zeros(B, C, H, halo_size, dtype=x.dtype, device=x.device)
+        
+        # Allocate buffers for sending boundaries (keep reference to prevent garbage collection)
+        send_left_buf = None
+        send_right_buf = None
         
         # List to track all async requests
         reqs = []
@@ -112,17 +116,17 @@ class ParallelConv2d(nn.Module):
             if self.rank > 0:
                 # Receive left halo from left neighbor
                 reqs.append(dist.irecv(left_halo, src=self.rank - 1, group=self.process_group))
-                # Send left boundary to left neighbor
-                left_boundary = x[:, :, :, :halo_size].contiguous()
-                reqs.append(dist.isend(left_boundary, dst=self.rank - 1, group=self.process_group))
+                # Send left boundary to left neighbor (keep reference to prevent GC)
+                send_left_buf = x[:, :, :, :halo_size].contiguous()
+                reqs.append(dist.isend(send_left_buf, dst=self.rank - 1, group=self.process_group))
             
             # Communicate with right neighbor (rank + 1)
             if self.rank < self.world_size - 1:
                 # Receive right halo from right neighbor
                 reqs.append(dist.irecv(right_halo, src=self.rank + 1, group=self.process_group))
-                # Send right boundary to right neighbor
-                right_boundary = x[:, :, :, -halo_size:].contiguous()
-                reqs.append(dist.isend(right_boundary, dst=self.rank + 1, group=self.process_group))
+                # Send right boundary to right neighbor (keep reference to prevent GC)
+                send_right_buf = x[:, :, :, -halo_size:].contiguous()
+                reqs.append(dist.isend(send_right_buf, dst=self.rank + 1, group=self.process_group))
         
         # Wait for all communication to complete
         for req in reqs:
