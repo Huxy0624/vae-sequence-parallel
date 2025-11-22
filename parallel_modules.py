@@ -144,13 +144,14 @@ class ParallelConv2d(nn.Module):
         # Concatenate: [left_part, x, right_part]
         x_padded = torch.cat([left_part, x, right_part], dim=3)
         
-        # Apply convolution with padding=0 (we've done manual padding via halos)
+        # Apply convolution with manual width padding but keep height padding
+        # padding=(height_padding, width_padding): use original for height, 0 for width
         y = torch.nn.functional.conv2d(
             x_padded,
             self.conv.weight,
             self.conv.bias,
             stride=self.conv.stride,
-            padding=0,  # Manual padding via halos
+            padding=(self.conv.padding[0], 0),  # Keep height padding, zero width padding
             dilation=self.conv.dilation,
             groups=self.conv.groups,
         )
