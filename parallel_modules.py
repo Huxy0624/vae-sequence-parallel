@@ -102,13 +102,28 @@ class ParallelConv2d(nn.Module):
             for req in reqs:
                 req.wait()
             
-            # Step 3: Concatenate halo regions
+            # Step 3: Add padding and halo regions
+            # For boundary ranks, we need to add zero padding on the side without a neighbor
             parts = []
+            
+            # Left padding
             if left_rank is not None:
-                parts.append(recv_left)
+                parts.append(recv_left)  # Received from left neighbor
+            else:
+                # No left neighbor, add zero padding
+                zero_pad_left = torch.zeros(B, C, H, self.padding, dtype=x.dtype, device=x.device)
+                parts.append(zero_pad_left)
+            
+            # Middle (our local data)
             parts.append(x)
+            
+            # Right padding
             if right_rank is not None:
-                parts.append(recv_right)
+                parts.append(recv_right)  # Received from right neighbor
+            else:
+                # No right neighbor, add zero padding
+                zero_pad_right = torch.zeros(B, C, H, self.padding, dtype=x.dtype, device=x.device)
+                parts.append(zero_pad_right)
             
             x_padded = torch.cat(parts, dim=3)
         elif self.padding > 0:
