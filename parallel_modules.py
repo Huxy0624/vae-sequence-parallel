@@ -74,40 +74,68 @@ class ParallelConv2d(nn.Module):
     
     def forward(self, x: Tensor) -> Tensor:
         """
-        Forward pass for ParallelConv2d.
+        Forward pass for ParallelConv2d using Halo Exchange strategy.
         
         Input x has shape (B, C, H, W_local) where W_local is the width slice for this rank.
         
-        Strategy:
+        Strategy (Halo Exchange):
         1. If not distributed or world_size == 1: directly call self.conv(x)
         2. If world_size > 1:
-           - All-gather x from all ranks to get full x_full
-           - Apply self.conv on full input
-           - Slice output back to local chunk for this rank
+           - Exchange halos (boundary regions) with neighboring ranks
+           - Apply convolution with padding=0 (manual padding via halos)
+           - Return local output (no slicing needed)
         """
         # Path 1: Not distributed or single process
         if self.world_size == 1:
             return self.conv(x)
         
-        # Path 2: Multi-process - gather, compute, slice
-        # Step 1: All-gather to get full input
-        x_list = [torch.zeros_like(x) for _ in range(self.world_size)]
-        dist.all_gather(x_list, x, group=self.process_group)
+        # Path 2: Multi-process - Halo Exchange
+        # Calculate halo size based on padding
+        padding = self.conv.padding
+        if isinstance(padding, int):
+            halo_size = padding
+        else:
+            halo_size = padding[1]  # Width padding
         
-        # Step 2: Concatenate along width dimension (dim=-1 or dim=3)
-        x_full = torch.cat(x_list, dim=-1)  # [B, C_in, H, W]
+        B, C, H, W_local = x.shape
         
-        # Step 3: Apply convolution on full tensor
-        y_full = self.conv(x_full)  # [B, C_out, H_out, W_out]
+        # Initialize halos
+        left_halo = torch.zeros(B, C, H, halo_size, dtype=x.dtype, device=x.device)
+        right_halo = torch.zeros(B, C, H, halo_size, dtype=x.dtype, device=x.device)
         
-        # Step 4: Slice output back to local chunk
-        B, C_out, H_out, W_out = y_full.shape
-        chunk = W_out // self.world_size
-        start = self.rank * chunk
-        end = (self.rank + 1) * chunk if self.rank != self.world_size - 1 else W_out
-        y_local = y_full[:, :, :, start:end].contiguous()
+        # Exchange halos with neighbors
+        if self.world_size > 1:
+            # Send/Receive with left neighbor (rank - 1)
+            if self.rank > 0:
+                # Send left boundary to left neighbor, receive left halo from left neighbor
+                left_boundary = x[:, :, :, :halo_size].contiguous()
+                dist.send(left_boundary, dst=self.rank - 1, group=self.process_group)
+                dist.recv(left_halo, src=self.rank - 1, group=self.process_group)
+            # else: rank 0, left_halo remains zeros (global padding)
+            
+            # Send/Receive with right neighbor (rank + 1)
+            if self.rank < self.world_size - 1:
+                # Send right boundary to right neighbor, receive right halo from right neighbor
+                right_boundary = x[:, :, :, -halo_size:].contiguous()
+                dist.send(right_boundary, dst=self.rank + 1, group=self.process_group)
+                dist.recv(right_halo, src=self.rank + 1, group=self.process_group)
+            # else: last rank, right_halo remains zeros (global padding)
         
-        return y_local
+        # Concatenate: [left_halo, x, right_halo]
+        x_padded = torch.cat([left_halo, x, right_halo], dim=3)
+        
+        # Apply convolution with padding=0 (we've done manual padding)
+        y = torch.nn.functional.conv2d(
+            x_padded,
+            self.conv.weight,
+            self.conv.bias,
+            stride=self.conv.stride,
+            padding=0,  # Manual padding via halos
+            dilation=self.conv.dilation,
+            groups=self.conv.groups,
+        )
+        
+        return y
 
 
 class ParallelGroupNorm(nn.Module):
